@@ -229,6 +229,9 @@ exports.processQrScanOnStampCreation_transitional = functions
 
         try {
             let userName; // 푸시 알림에서도 사용할 수 있도록 외부에 선언
+            let captainPreRegistered = false;
+            let baitRevoked = false;
+            let couponFlagCleared = false;
 
             await db.runTransaction(async (transaction) => {
                 const userRef = db.collection('users').doc(userId);
@@ -262,13 +265,23 @@ exports.processQrScanOnStampCreation_transitional = functions
 
                 // method가 QR인 경우에만 승선 명부와 미끼 교환권을 처리
                 if (method === "QR") {
+                    const attendanceData = attendanceDoc.exists ? attendanceDoc.data() : {};
+                    const existingMembers = Array.isArray(attendanceData?.members) ? attendanceData.members : [];
+                    const alreadyInAttendance = existingMembers.includes(userId);
+                    captainPreRegistered = alreadyInAttendance;
+
                     // 1. 승선 명부 확인 및 처리 (문서 존재 여부에 따라 다르게 처리)
                     if (attendanceDoc.exists) {
                         // 문서가 존재하면 update로 arrayUnion 사용
-                        transaction.update(attendanceRef, {
-                            members: admin.firestore.FieldValue.arrayUnion(userId),
+                        const attendanceUpdatePayload = {
                             updatedAt: now,
-                        });
+                        };
+
+                        if (!alreadyInAttendance) {
+                            attendanceUpdatePayload.members = admin.firestore.FieldValue.arrayUnion(userId);
+                        }
+
+                        transaction.update(attendanceRef, attendanceUpdatePayload);
                     } else {
                         // 문서가 없으면 set으로 새 배열 생성
                         transaction.set(attendanceRef, {
@@ -279,17 +292,37 @@ exports.processQrScanOnStampCreation_transitional = functions
                     }
 
                     // 2. 미끼 교환권 확인 및 처리 (중복 지급 방지)
-                    transaction.update(userRef, {
-                        baitCoupons: admin.firestore.FieldValue.increment(1),
-                        [couponFieldName]: true
-                    });
+                    if (alreadyInAttendance) {
+                        const userUpdates = {};
+                        const currentBaitCoupons = Number(userDoc.data()?.baitCoupons) || 0;
 
-                    // 3. 승선 횟수 증가 (crew 여부와 관계없이 모든 승선자 카운트)
-                    transaction.update(userRef, {
-                        tripCount: admin.firestore.FieldValue.increment(1)
-                    });
+                        if (currentBaitCoupons > 0) {
+                            userUpdates.baitCoupons = admin.firestore.FieldValue.increment(-1);
+                            baitRevoked = true;
+                        }
 
-                    console.log(`QR Log (Transitional): '${userName}(${userId})'님의 QR 스탬프 처리를 확인하고 완료했습니다.`);
+                        if (userDoc.data()?.[couponFieldName]) {
+                            userUpdates[couponFieldName] = admin.firestore.FieldValue.delete();
+                            couponFlagCleared = true;
+                        }
+
+                        if (Object.keys(userUpdates).length > 0) {
+                            transaction.update(userRef, userUpdates);
+                        }
+
+                        transaction.delete(stampRef);
+
+                        console.log(`QR Log (Transitional): '${userName}(${userId})'님은 이미 선장에 의해 승선 명부에 등록되어 QR 스캔에 따른 추가 미끼/스탬프 지급 없이 처리되었습니다.`);
+                    } else {
+                        transaction.update(userRef, {
+                            baitCoupons: admin.firestore.FieldValue.increment(1),
+                            [couponFieldName]: true,
+                            tripCount: admin.firestore.FieldValue.increment(1)
+                        });
+
+                        // 3. 승선 횟수 증가 (crew 여부와 관계없이 모든 승선자 카운트)
+                        console.log(`QR Log (Transitional): '${userName}(${userId})'님의 QR 스탬프 처리를 확인하고 완료했습니다.`);
+                    }
                 } else if (method === "ADMIN") {
                     // ADMIN 방식일 경우 승선 명부와 미끼 교환권을 지급하지 않음
                     // 하지만 승선 횟수는 증가시킴 (관리자 직접 등록도 승선으로 간주)
@@ -300,7 +333,9 @@ exports.processQrScanOnStampCreation_transitional = functions
                 }
 
                 // 3. 서버 처리 완료 플래그 설정 (이 함수 중복 실행 방지) - 모든 방식에서 공통
-                transaction.update(stampRef, { processedByServer: true });
+                if (!(method === "QR" && captainPreRegistered)) {
+                    transaction.update(stampRef, { processedByServer: true });
+                }
             });
 
             // --- 푸시 알림 전송 로직 ---
@@ -317,7 +352,12 @@ exports.processQrScanOnStampCreation_transitional = functions
                 let userMessageBody;
 
                 if (method === "QR") {
-                    userMessageBody = `${userName}님, 미끼 교환권 1장이 지급되었으며 승선 명부에 등록되었습니다.`;
+                    if (captainPreRegistered) {
+                        userMessageTitle = 'QR 스캔 확인';
+                        userMessageBody = `${userName}님, 이미 선장이 승선 명부에 등록한 상태여서 QR 스캔은 확인만 되었고 추가 스탬프·미끼는 지급되지 않았어요.`;
+                    } else {
+                        userMessageBody = `${userName}님, 미끼 교환권 1장이 지급되었으며 승선 명부에 등록되었습니다.`;
+                    }
                 } else if (method === "ADMIN") {
                     userMessageBody = `${userName}님, 관리자에 의해 스탬프가 적립되었습니다.`;
                 } else {
@@ -349,8 +389,13 @@ exports.processQrScanOnStampCreation_transitional = functions
                         let adminTitle, adminBody;
 
                         if (method === "QR") {
-                            adminTitle = '승선 알림';
-                            adminBody = `사용자 '${userName}(${userId})'님이 QR 스캔을 완료하고 승선 명부에 등록되었습니다.`;
+                            if (captainPreRegistered) {
+                                adminTitle = 'QR 중복 처리 알림';
+                                adminBody = `사용자 '${userName}(${userId})'님은 선장이 이미 명부에 올린 상태여서 QR 스캔 시 추가 스탬프/미끼 없이 확인 처리되었습니다.`;
+                            } else {
+                                adminTitle = '승선 알림';
+                                adminBody = `사용자 '${userName}(${userId})'님이 QR 스캔을 완료하고 승선 명부에 등록되었습니다.`;
+                            }
                         } else if (method === "ADMIN") {
                             adminTitle = '스탬프 적립 알림';
                             adminBody = `사용자 '${userName}(${userId})'님에게 관리자 권한으로 스탬프가 적립되었습니다.`;
@@ -376,8 +421,13 @@ exports.processQrScanOnStampCreation_transitional = functions
             let actionDetail, actionType;
 
             if (method === "QR") {
-                actionType = 'qrScanProcessed_transitional';
-                actionDetail = 'Server ensured bait coupon and attendance list are correct during transition.';
+                if (captainPreRegistered) {
+                    actionType = 'qrScanPreRegisteredResolved';
+                    actionDetail = `Captain pre-registered passenger; bait${baitRevoked ? ' revoked' : ' unchanged'} and stamp entry was rolled back${couponFlagCleared ? ', coupon flag cleared' : ''}.`;
+                } else {
+                    actionType = 'qrScanProcessed_transitional';
+                    actionDetail = 'Server ensured bait coupon and attendance list are correct during transition.';
+                }
             } else if (method === "ADMIN") {
                 actionType = 'adminStampProcessed';
                 actionDetail = 'Admin created stamp without affecting attendance or bait coupons.';
